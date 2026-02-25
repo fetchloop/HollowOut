@@ -43,11 +43,14 @@ int main()
 
     } while (!confirmed);
 
+    // Get the process id's from the user input.
     DWORD host_process_id = process::get_process_id(host);
     DWORD hider_process_id = process::get_process_id(hider);
 
+    // Hollow the host and hide the hider from given process ids.
     process::hollow_process(host_process_id, hider_process_id);
 
+    // Halt execution until user input closes the program.
     std::cin.get();
     return 0;
 }
